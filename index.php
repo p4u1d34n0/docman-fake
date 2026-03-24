@@ -38,6 +38,7 @@ final class Config
     public readonly ?int $forceHttpStatus;
     public readonly int $maxFileSizeMb;
     public readonly bool $simulateDc02;
+    public readonly int $chaosInterval;
 
     private static ?self $instance = null;
 
@@ -59,6 +60,7 @@ final class Config
             getenv('SIMULATE_DC02') ?: 'false',
             FILTER_VALIDATE_BOOLEAN,
         );
+        $this->chaosInterval = (int) (getenv('CHAOS_INTERVAL') ?: '0');
     }
 
     public static function get(): self
@@ -518,6 +520,143 @@ final class DocumentValidator
 }
 
 // ---------------------------------------------------------------------------
+// Chaos mode: rotate through different failure types every N requests
+// ---------------------------------------------------------------------------
+
+final class ChaosEngine
+{
+    private const COUNTER_PATH = '/tmp/docman-chaos-counter.txt';
+
+    /**
+     * Failure scenarios that cycle in order.
+     * Each has: HTTP status, error code, error message, and optional extra fields.
+     */
+    private const SCENARIOS = [
+        [
+            'status' => 500,
+            'response' => [
+                'error' => 'Internal Server Error',
+                'message' => 'Simulated system malfunction.',
+                'StatusCode' => 5000,
+            ],
+            'label' => '500 Internal Server Error (StatusCode 5000)',
+        ],
+        [
+            'status' => 400,
+            'response' => [
+                'Errors' => [['ErrorCode' => 'DC02', 'ErrorMessage' => 'Recipient ODS code is inactive or not found.']],
+            ],
+            'label' => 'DC02 — Recipient ODS inactive',
+        ],
+        [
+            'status' => 400,
+            'response' => [
+                'Errors' => [['ErrorCode' => 'DC03', 'ErrorMessage' => 'Recipient ODS code is not an authorised receiving organisation.']],
+            ],
+            'label' => 'DC03 — Recipient ODS not authorised',
+        ],
+        [
+            'status' => 400,
+            'response' => [
+                'Errors' => [['ErrorCode' => 'DC01.01', 'ErrorMessage' => 'Patient data is missing.']],
+            ],
+            'label' => 'DC01.01 — Patient data missing',
+        ],
+        [
+            'status' => 400,
+            'response' => [
+                'Errors' => [['ErrorCode' => 'DC01.21', 'ErrorMessage' => 'RecipientOdsCode is missing or invalid.']],
+            ],
+            'label' => 'DC01.21 — Recipient ODS invalid',
+        ],
+        [
+            'status' => 400,
+            'response' => [
+                'Errors' => [['ErrorCode' => 'DC01.31', 'ErrorMessage' => 'File content is missing.']],
+            ],
+            'label' => 'DC01.31 — File content missing',
+        ],
+        [
+            'status' => 400,
+            'response' => [
+                'Errors' => [['ErrorCode' => 'DC01.09', 'ErrorMessage' => 'Patient BirthDate must not be a future date.']],
+            ],
+            'label' => 'DC01.09 — Future birth date',
+        ],
+        [
+            'status' => 503,
+            'response' => [
+                'error' => 'Service Unavailable',
+                'message' => 'The Docman Connect service is temporarily unavailable.',
+                'StatusCode' => 7000,
+            ],
+            'label' => '503 Service Unavailable (StatusCode 7000)',
+        ],
+        [
+            'status' => 401,
+            'response' => [
+                'error' => 'invalid_token',
+                'error_description' => 'The access token has expired.',
+            ],
+            'label' => '401 — Token expired',
+        ],
+        [
+            'status' => 429,
+            'response' => [
+                'error' => 'Too Many Requests',
+                'message' => 'Rate limit exceeded. Try again later.',
+            ],
+            'label' => '429 — Rate limited',
+        ],
+    ];
+
+    /**
+     * Check if this request should be a chaos failure.
+     * Returns null if the request should proceed normally, or the failure scenario if it should fail.
+     */
+    public static function check(int $chaosInterval): ?array
+    {
+        if ($chaosInterval <= 0) {
+            return null;
+        }
+
+        $count = self::incrementCounter();
+
+        if ($count % $chaosInterval !== 0) {
+            return null;
+        }
+
+        // Pick the scenario based on how many failures we've triggered
+        $failureNumber = (int) ($count / $chaosInterval);
+        $scenarioIndex = ($failureNumber - 1) % count(self::SCENARIOS);
+
+        return self::SCENARIOS[$scenarioIndex];
+    }
+
+    public static function getCounter(): int
+    {
+        if (!file_exists(self::COUNTER_PATH)) {
+            return 0;
+        }
+
+        return (int) file_get_contents(self::COUNTER_PATH);
+    }
+
+    public static function resetCounter(): void
+    {
+        file_put_contents(self::COUNTER_PATH, '0');
+    }
+
+    private static function incrementCounter(): int
+    {
+        $count = self::getCounter() + 1;
+        file_put_contents(self::COUNTER_PATH, (string) $count);
+
+        return $count;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
 
@@ -607,6 +746,16 @@ if ($config->forceErrorCode !== null && $method === 'POST' && $uri === '/api/doc
             'message' => "Forced error: {$config->forceErrorCode}",
         ],
     ]);
+}
+
+// Chaos mode: rotate through different failure types every N document uploads
+if ($config->chaosInterval > 0 && $method === 'POST' && $uri === '/api/documents') {
+    $chaosScenario = ChaosEngine::check($config->chaosInterval);
+    if ($chaosScenario !== null) {
+        $counter = ChaosEngine::getCounter();
+        logMessage("CHAOS [{$counter}]: {$chaosScenario['label']}");
+        sendJson($chaosScenario['response'], $chaosScenario['status']);
+    }
 }
 
 // Random failure simulation (except health and history endpoints)
@@ -800,6 +949,8 @@ if ($method === 'GET' && $uri === '/api/health') {
             'force_http_status' => $config->forceHttpStatus,
             'max_file_size_mb' => $config->maxFileSizeMb,
             'simulate_dc02' => $config->simulateDc02,
+            'chaos_interval' => $config->chaosInterval,
+            'chaos_request_count' => ChaosEngine::getCounter(),
         ],
     ]);
 }
@@ -829,8 +980,9 @@ if ($method === 'GET' && preg_match('#^/api/history/(.+)$#', $uri, $matches)) {
 if ($method === 'DELETE' && $uri === '/api/history') {
     $count = DocumentHistory::count();
     DocumentHistory::clear();
+    ChaosEngine::resetCounter();
 
-    logMessage("History cleared ({$count} documents removed)");
+    logMessage("History cleared ({$count} documents removed, chaos counter reset)");
 
     sendJson([
         'status' => 'cleared',

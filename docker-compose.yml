@@ -10,6 +10,7 @@ services:
       - SLOW_RESPONSE_MS=0
       - MAX_FILE_SIZE_MB=10
       - SIMULATE_DC02=false
+      - CHAOS_INTERVAL=0
 
   # Example: using alongside a Laravel application
   # Uncomment and adjust for your project.

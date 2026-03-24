@@ -343,7 +343,9 @@ curl -s http://localhost:8089/api/health
         "force_error_code": null,
         "force_http_status": null,
         "max_file_size_mb": 10,
-        "simulate_dc02": false
+        "simulate_dc02": false,
+        "chaos_interval": 5,
+        "chaos_request_count": 12
     }
 }
 ```
@@ -412,6 +414,7 @@ curl -s -X DELETE http://localhost:8089/api/history \
 | `FORCE_HTTP_STATUS` | _(empty)_ | If set, all requests (except health) return this HTTP status |
 | `MAX_FILE_SIZE_MB` | `10` | Maximum decoded file size in megabytes |
 | `SIMULATE_DC02` | `false` | When `true`, all document uploads fail with DC02 (inactive ODS code) |
+| `CHAOS_INTERVAL` | `0` | When > 0, every Nth document upload fails with a rotating error type (see Chaos Mode) |
 
 ## Failure Simulation
 
@@ -459,6 +462,37 @@ Simulate the recipient ODS code being inactive or not found:
 
 ```bash
 docker run -p 8089:8089 -e SIMULATE_DC02=true docman-fake
+```
+
+### Chaos mode (rotating failures)
+
+The most realistic testing mode. Every Nth document upload fails, cycling through different error types each time. This tests that your application handles a variety of failures, not just one.
+
+```bash
+docker run -p 8089:8089 -e CHAOS_INTERVAL=5 docman-fake
+```
+
+With `CHAOS_INTERVAL=5`, requests 1-4 succeed, request 5 fails, requests 6-9 succeed, request 10 fails with a different error, and so on. The failure type rotates through:
+
+| # | Failure | HTTP | StatusCode |
+|---|---------|------|------------|
+| 1st | 500 Internal Server Error | 500 | 5000 |
+| 2nd | DC02 -- Recipient ODS inactive | 400 | -- |
+| 3rd | DC03 -- Recipient ODS not authorised | 400 | -- |
+| 4th | DC01.01 -- Patient data missing | 400 | -- |
+| 5th | DC01.21 -- Recipient ODS invalid | 400 | -- |
+| 6th | DC01.31 -- File content missing | 400 | -- |
+| 7th | DC01.09 -- Future birth date | 400 | -- |
+| 8th | 503 Service Unavailable | 503 | 7000 |
+| 9th | 401 -- Token expired | 401 | -- |
+| 10th | 429 -- Rate limited | 429 | -- |
+
+After cycling through all 10 types, it starts again from the top. The chaos counter is visible in `/api/health` and resets when you `DELETE /api/history`.
+
+Example: to fail every 3rd request for aggressive testing:
+
+```bash
+docker run -p 8089:8089 -e CHAOS_INTERVAL=3 docman-fake
 ```
 
 ### Strict authentication
